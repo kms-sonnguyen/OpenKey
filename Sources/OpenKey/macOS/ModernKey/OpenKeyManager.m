@@ -25,10 +25,15 @@ extern NSString* ConvertUtil(NSString* str);
 
 }
 static BOOL _isInited = NO;
+static BOOL _isEngineInited = NO;
 
 static CFMachPortRef      eventTap;
 static CGEventMask        eventMask;
 static CFRunLoopSourceRef runLoopSource;
+static NSTimer*           watchdogTimer = nil;
+
+// How often the watchdog checks that macOS has not silently disabled the tap.
+static const NSTimeInterval kWatchdogInterval = 3.0;
 
 +(BOOL)isInited {
     return _isInited;
@@ -37,10 +42,14 @@ static CFRunLoopSourceRef runLoopSource;
 +(BOOL)initEventTap {
     if (_isInited)
         return true;
-    
-    //init modernKey
-    OpenKeyInit();
-    
+
+    //init modernKey only once: it loads settings and allocates the event source /
+    //engine state. Re-running it on every wake leaked those objects.
+    if (!_isEngineInited) {
+        OpenKeyInit();
+        _isEngineInited = YES;
+    }
+
     // Create an event tap. We are interested in key presses.
     eventMask = ((1 << kCGEventKeyDown) |
                  (1 << kCGEventKeyUp) |
@@ -73,11 +82,37 @@ static CFRunLoopSourceRef runLoopSource;
     
     // Enable the event tap.
     CGEventTapEnable(eventTap, true);
-    
+
+    // Backup for the in-callback re-enable: if macOS disables the tap and the
+    // disable notification is somehow missed, turn it back on periodically.
+    [self startWatchdog];
+
     return YES;
 }
 
++(void)startWatchdog {
+    [self stopWatchdog];
+    // selector-based API (block-based NSTimer needs macOS 10.12+)
+    watchdogTimer = [NSTimer timerWithTimeInterval:kWatchdogInterval
+                                            target:self
+                                          selector:@selector(onWatchdogTick:)
+                                          userInfo:nil
+                                           repeats:YES];
+    watchdogTimer.tolerance = 1.0;
+    [[NSRunLoop mainRunLoop] addTimer:watchdogTimer forMode:NSRunLoopCommonModes];
+}
+
++(void)onWatchdogTick:(NSTimer*)timer {
+    [self reEnableEventTap];
+}
+
++(void)stopWatchdog {
+    [watchdogTimer invalidate];
+    watchdogTimer = nil;
+}
+
 +(BOOL)stopEventTap {
+    [self stopWatchdog];
     if (_isInited) { //release all object
         CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
         CFRelease(runLoopSource);
@@ -90,6 +125,15 @@ static CFRunLoopSourceRef runLoopSource;
         _isInited = false;
     }
     return YES;
+}
+
+// macOS disables the tap if the callback is too slow (kCGEventTapDisabledByTimeout)
+// or on certain user input (kCGEventTapDisabledByUserInput). Turn it back on,
+// otherwise Vietnamese typing silently stops until the app is restarted.
++(void)reEnableEventTap {
+    if (_isInited && eventTap != NULL && !CGEventTapIsEnabled(eventTap)) {
+        CGEventTapEnable(eventTap, true);
+    }
 }
 
 +(NSArray*)getTableCodes {

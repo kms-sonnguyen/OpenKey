@@ -534,11 +534,33 @@ extern bool convertToolDontAlertWhenCompleted;
 }
 
 #pragma mark Reset OpenKey after mac computer awake
+// Right after wake the login session may not be ready yet, so creating the
+// event tap can fail. Retry a few times instead of leaving typing broken
+// until the user restarts OpenKey.
+static const int kWakeRetryMaxAttempts = 10;
+static const NSTimeInterval kWakeRetryDelay = 2.0;
+static NSUInteger _wakeGeneration = 0;
+
+-(void)initEventTapAfterWake:(int)attempt generation:(NSUInteger)generation {
+    if (generation != _wakeGeneration) return; //went to sleep again meanwhile
+    if ([OpenKeyManager initEventTap]) return;
+    if (attempt + 1 >= kWakeRetryMaxAttempts) {
+        NSLog(@"OpenKey: failed to re-create event tap after wake (%d attempts)", attempt + 1);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWakeRetryDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self initEventTapAfterWake:attempt + 1 generation:generation];
+    });
+}
+
 -(void)receiveWakeNote: (NSNotification*)note {
-    [OpenKeyManager initEventTap];
+    _wakeGeneration++;
+    [self initEventTapAfterWake:0 generation:_wakeGeneration];
 }
 
 -(void)receiveSleepNote: (NSNotification*)note {
+    _wakeGeneration++; //cancel any pending wake retries
     [OpenKeyManager stopEventTap];
 }
 

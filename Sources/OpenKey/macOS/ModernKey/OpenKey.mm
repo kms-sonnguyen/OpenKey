@@ -11,6 +11,7 @@
 #import "Engine.h"
 #import "AppDelegate.h"
 #import "ViewController.h"
+#import "OpenKeyManager.h"
 
 #define FRONT_APP [[NSWorkspace sharedWorkspace] frontmostApplication].bundleIdentifier
 #define OTHER_CONTROL_KEY (_flag & kCGEventFlagMaskCommand) || (_flag & kCGEventFlagMaskControl) || \
@@ -175,11 +176,21 @@ extern "C" {
         return false;
     }
 
+    // -1 = not computed for the current keystroke; reset at the start of every callback.
+    // CGWindowListCopyWindowInfo is expensive, so call it at most once per keystroke
+    // to keep the event tap callback fast (slow callbacks get the tap disabled by macOS).
+    int _spotlightVisibleCache = -1;
+
     BOOL isSpotlightVisible() {
+        if (_spotlightVisibleCache >= 0) {
+            return _spotlightVisibleCache == 1;
+        }
+        _spotlightVisibleCache = 0;
         NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
                                                                         kCGNullWindowID));
         for (NSDictionary *window in windows) {
             if ([[window objectForKey:(__bridge NSString *)kCGWindowOwnerName] isEqualToString:@"Spotlight"]) {
+                _spotlightVisibleCache = 1;
                 return true;
             }
         }
@@ -194,7 +205,7 @@ extern "C" {
     }
 
     BOOL shouldUseSelectionReplacement(NSString* topApp) {
-        return isSpotlightVisible() || [_recommendWorkaroundDisabledApp containsObject:topApp];
+        return [_recommendWorkaroundDisabledApp containsObject:topApp] || isSpotlightVisible();
     }
     
     void saveSmartSwitchKeyData() {
@@ -599,6 +610,15 @@ extern "C" {
      * MAIN Callback.
      */
     CGEventRef OpenKeyCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+        //macOS turned the tap off (callback too slow / secure input): turn it back on
+        if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+            [OpenKeyManager reEnableEventTap];
+            return event;
+        }
+
+        //new keystroke: invalidate the per-keystroke Spotlight cache
+        _spotlightVisibleCache = -1;
+
         //dont handle my event
         if (CGEventGetIntegerValueField(event, kCGEventSourceStateID) == CGEventSourceGetSourceStateID(myEventSource)) {
             return event;
@@ -692,19 +712,20 @@ extern "C" {
 
         //if "turn off Vietnamese when in other language" mode on
         if(vOtherLanguage){
+            // isource is owned (Copy rule) and must be released on every path.
+            // languages / langRef come from Get calls and are NOT owned: never release them.
             TISInputSourceRef isource = TISCopyCurrentKeyboardInputSource();
-            if ( isource != NULL )
-            {
-                CFArrayRef languages = (CFArrayRef) TISGetInputSourceProperty(isource, kTISPropertyInputSourceLanguages);
-                
-                if (CFArrayGetCount(languages) > 0) {
+            if (isource != NULL) {
+                bool isOtherLanguage = false;
+                CFArrayRef languages = (CFArrayRef)TISGetInputSourceProperty(isource, kTISPropertyInputSourceLanguages);
+                if (languages != NULL && CFArrayGetCount(languages) > 0) {
                     CFStringRef langRef = (CFStringRef)CFArrayGetValueAtIndex(languages, 0);
                     NSString *currentLanguage = (__bridge NSString *)langRef;
-                    if(![currentLanguage isLike:@"en"]){
-                        return event;
-                    }
-                    CFRelease(langRef);
-                    CFRelease(isource);
+                    isOtherLanguage = ![currentLanguage isLike:@"en"];
+                }
+                CFRelease(isource);
+                if (isOtherLanguage) {
+                    return event;
                 }
             }
         }
@@ -753,7 +774,7 @@ extern "C" {
                     }
                 }
 
-                if (shouldUseSelectionReplacement(FRONT_APP) && pData->backspaceCount > 0) {
+                if (pData->backspaceCount > 0 && shouldUseSelectionReplacement(FRONT_APP)) {
                     for (_i = 0; _i < pData->backspaceCount; _i++) {
                         SendShiftAndLeftArrow();
                     }
